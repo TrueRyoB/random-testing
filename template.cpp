@@ -17,7 +17,9 @@ void solve() {
   ***/
 }
 
-int main() {
+int main(int argc, char** argv) {
+  // if (argc != 3) return 2;
+  // std::ifstream answerA(argv[1]), answerB(argv[2]);
   int T; cin>>T;
   while(T-->0) solve();
 }

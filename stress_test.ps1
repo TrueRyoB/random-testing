@@ -7,6 +7,8 @@ param(
     [Parameter(Mandatory, Position = 0)] [string] $Generator,
     [Parameter(Mandatory, Position = 1)] [string] $ProgramA,
     [Parameter(Mandatory, Position = 2)] [string] $ProgramB,
+    [Parameter(Position = 3, HelpMessage = 'Optional C++ evaluator. It receives Program A and Program B output-file paths as argv[1] and argv[2], and must exit 0 to accept.')]
+    [string] $Evaluator,
     [ValidateRange(0, [int]::MaxValue)] [int] $Iterations = 0,
     [ValidateRange(0.001, [double]::MaxValue)] [double] $TimeoutSeconds = 3,
     [Parameter(HelpMessage = 'Compiler command or full path to g++.exe, for example C:\\tools\\mingw64\\bin\\g++.exe')]
@@ -36,13 +38,47 @@ function Compile-Source([string] $Source, [string] $Name) {
     return (Resolve-Path -LiteralPath $output).Path
 }
 
-function Invoke-Program([string] $FileName, [string] $InputText) {
+function ConvertTo-ProcessArgument([string] $Argument) {
+    # Quote according to the Windows CommandLineToArgvW rules. This also works
+    # with the usual argv parsing on Unix and keeps this script compatible
+    # with Windows PowerShell 5.1, which lacks ProcessStartInfo.ArgumentList.
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $quoted = [Text.StringBuilder]::new()
+    [void] $quoted.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+        }
+        elseif ($character -eq '"') {
+            [void] $quoted.Append('\', 2 * $backslashes + 1)
+            [void] $quoted.Append('"')
+            $backslashes = 0
+        }
+        else {
+            if ($backslashes -gt 0) { [void] $quoted.Append('\', $backslashes) }
+            [void] $quoted.Append($character)
+            $backslashes = 0
+        }
+    }
+    if ($backslashes -gt 0) { [void] $quoted.Append('\', 2 * $backslashes) }
+    [void] $quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-Program([string] $FileName, [string] $InputText, [string[]] $Arguments = @()) {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $FileName
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    if ($Arguments.Count -gt 0) {
+        $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
+    }
 
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -143,6 +179,13 @@ function Save-Failure([string] $Reason, [string] $InputText, $ResultA, $ResultB)
     return $directory
 }
 
+function Save-EvaluatorResult([string] $Directory, $Result) {
+    if ($null -eq $Result) { return }
+    Write-Utf8File (Join-Path $Directory 'evaluator.stdout.txt') $Result.Stdout
+    Write-Utf8File (Join-Path $Directory 'evaluator.stderr.txt') $Result.Stderr
+    Write-Utf8File (Join-Path $Directory 'evaluator.exit_code.txt') ($Result.ExitCode)
+}
+
 function Show-FailingInput([string] $InputText) {
     Write-Host "`n--- failing generated input ---"
     Write-Host $InputText
@@ -172,6 +215,11 @@ $buildPath = (New-Item -ItemType Directory -Force -Path $BuildDir).FullName
 $generatorExe = Compile-Source (Get-SourcePath $Generator) 'generator'
 $programAExe = Compile-Source (Get-SourcePath $ProgramA) 'program_a'
 $programBExe = Compile-Source (Get-SourcePath $ProgramB) 'program_b'
+if ($Evaluator) {
+    $evaluatorExe = Compile-Source (Get-SourcePath $Evaluator) 'evaluator'
+    $evaluatorOutputAPath = Join-Path $buildPath 'evaluator-program-a-output.txt'
+    $evaluatorOutputBPath = Join-Path $buildPath 'evaluator-program-b-output.txt'
+}
 
 $test = 0
 try {
@@ -202,7 +250,21 @@ try {
             Show-FailingInput $generated.Stdout
             exit 1
         }
-        if ((Get-NormalizedOutput $a.Stdout) -ne (Get-NormalizedOutput $b.Stdout)) {
+        if ($Evaluator) {
+            Write-Utf8File $evaluatorOutputAPath $a.Stdout
+            Write-Utf8File $evaluatorOutputBPath $b.Stdout
+            $evaluation = Invoke-Program $evaluatorExe $null @($evaluatorOutputAPath, $evaluatorOutputBPath)
+            if ($evaluation.TimedOut -or $evaluation.ExitCode -ne 0) {
+                $reason = if ($evaluation.TimedOut) { 'Evaluator timed out' } else { "Evaluator rejected outputs (exit code $($evaluation.ExitCode))" }
+                $directory = Save-Failure $reason $generated.Stdout $a $b
+                Save-EvaluatorResult $directory $evaluation
+                Write-Host "FAIL on test ${test}: $reason. Details: $directory" -ForegroundColor Red
+                if ($evaluation.Stderr) { Write-Host "--- evaluator error output ---`n$($evaluation.Stderr)" -ForegroundColor Red }
+                Show-FailingInput $generated.Stdout
+                exit 1
+            }
+        }
+        elseif ((Get-NormalizedOutput $a.Stdout) -ne (Get-NormalizedOutput $b.Stdout)) {
             $directory = Save-Failure 'Outputs differ' $generated.Stdout $a $b
             Write-Host "FAIL on test ${test}: outputs differ. Details: $directory" -ForegroundColor Red
             $mismatch = Get-FirstOutputMismatch $a.Stdout $b.Stdout
@@ -222,4 +284,9 @@ catch [System.Management.Automation.PipelineStoppedException] {
     exit 130
 }
 
-Write-Host "`nAll $test test(s) matched."
+if ($Evaluator) {
+    Write-Host "`nAll $test test(s) accepted by evaluator."
+}
+else {
+    Write-Host "`nAll $test test(s) matched."
+}
